@@ -18,7 +18,7 @@ from enum import Enum
 from omegaconf import DictConfig
 
 from verl.single_controller.base import Worker
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, uses_local_teacher
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 WorkerType = type[Worker]
@@ -82,8 +82,23 @@ def need_reference_policy(
 def need_teacher_policy(
     config: DictConfig,
 ) -> bool:
-    """Given the config, do we need distillation policy."""
-    return is_distillation_enabled(config.get("distillation"))
+    """Given the config, do we need a remote distillation teacher policy."""
+    distillation_config = config.get("distillation")
+    return is_distillation_enabled(distillation_config) and not uses_local_teacher(distillation_config)
+
+
+def need_local_teacher_policy(config: DictConfig) -> bool:
+    """Given the config, do we need a teacher colocated with the actor worker."""
+    return uses_local_teacher(config.get("distillation"))
+
+
+def validate_local_teacher_policy(config: DictConfig) -> None:
+    """Reject reference-policy settings that would alias the local teacher engine."""
+    if need_local_teacher_policy(config) and need_reference_policy(config):
+        raise ValueError(
+            "full_reverse_kl uses the colocated reference engine for the frozen teacher; "
+            "disable algorithm.use_kl_in_reward and actor_rollout_ref.actor.use_kl_loss"
+        )
 
 
 def need_reward_model(

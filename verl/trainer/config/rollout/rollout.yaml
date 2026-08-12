@@ -22,6 +22,9 @@ top_k: -1
 # Top-p sampling parameter. Default 1.0.
 top_p: 1
 
+# Repetition penalty for rollout sampling.
+repetition_penalty: 1.0
+
 # Whether to enable full determinism for reproducibility in rollout.
 # See https://pytorch.org/docs/stable/notes/randomness.html for details.
 full_determinism: false

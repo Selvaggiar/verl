@@ -48,7 +48,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, uses_local_teacher
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
@@ -516,7 +516,9 @@ class AgentLoopWorker:
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
 
         # Online policy distillation
-        self.distillation_enabled = is_distillation_enabled(config.distillation)
+        self.distillation_enabled = is_distillation_enabled(config.distillation) and not uses_local_teacher(
+            config.distillation
+        )
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 

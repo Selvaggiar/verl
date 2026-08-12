@@ -68,8 +68,10 @@ from verl.trainer.ppo.utils import (
     create_rl_dataset,
     create_rl_sampler,
     need_critic,
+    need_local_teacher_policy,
     need_reference_policy,
     need_teacher_policy,
+    validate_local_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
@@ -126,6 +128,7 @@ class PPOTrainer(ABC):
 
     def __init__(self, config: DictConfig):
         self.config = config
+        validate_local_teacher_policy(self.config)
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -273,16 +276,19 @@ class PPOTrainer(ABC):
         logger.info("reward loop manager initialized")
 
         # 8. initialize teacher loop manager
+        if is_distillation_enabled(self.config.get("distillation")):
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.distillation_config = None
+
         if self.use_teacher_policy:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
-            self.distillation_config = None
 
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
@@ -660,7 +666,8 @@ class PPOTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        needs_colocated_ref = (need_reference_policy(config) and not ref_in_actor) or need_local_teacher_policy(config)
+        role = Role.ActorRolloutRef if needs_colocated_ref else Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 
@@ -691,7 +698,7 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if need_teacher_policy(config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -1598,17 +1605,23 @@ class PPOTrainer(ABC):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_logits = (
+            distillation_use_topk or self.distillation_config.distillation_loss.loss_settings.use_local_teacher
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
             distillation_only = (
-                distillation_use_topk
+                distillation_use_logits
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
+            "distillation_use_logits": distillation_use_logits,
             "distillation_only": distillation_only,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,

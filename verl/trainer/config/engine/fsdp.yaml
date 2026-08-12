@@ -35,6 +35,9 @@ model_dtype: fp32
 # Whether to use original parameters in fsdp. Only avaiable in fsdp1
 use_orig_params: false
 
+# Keep a forward-only model on device during eval instead of using layer-wise CPU offload.
+keep_forward_only_model_on_device: false
+
 # Random seed for reproducibility.
 seed: 42
 

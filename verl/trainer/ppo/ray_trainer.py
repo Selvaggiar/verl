@@ -911,6 +911,11 @@ class RayPPOTrainer:
         self.async_rollout_mode = True
 
         # initialize teacher loop manager
+        if is_distillation_enabled(self.config.get("distillation")):
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.distillation_config = None
+
         if self.use_teacher_policy:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
@@ -919,10 +924,8 @@ class RayPPOTrainer:
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
-            self.distillation_config = None
 
         # Support custom AgentLoopManager via config
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
@@ -1304,11 +1307,16 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_logits = (
+            distillation_use_topk or self.distillation_config.distillation_loss.loss_settings.use_local_teacher
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
             distillation_only = (
-                distillation_use_topk
+                distillation_use_logits
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
@@ -1321,6 +1329,7 @@ class RayPPOTrainer:
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
+            distillation_use_logits=distillation_use_logits,
             distillation_only=distillation_only,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,

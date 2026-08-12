@@ -170,18 +170,25 @@ Defaults below are the YAML defaults from
 
 Whether on-policy distillation is enabled. Default: `false`.
 
-When `true`, `main_ppo` allocates a separate teacher resource pool and spins up
-one or more teacher inference servers; the actor loss switches from `ppo_loss`
-to `distillation_ppo_loss`.
+When `true`, the actor loss switches from `ppo_loss` to
+`distillation_ppo_loss`. Sampled-token and top-k modes allocate a separate
+teacher resource pool and inference server. `full_reverse_kl` instead loads a
+frozen FSDP teacher in the colocated actor/reference worker.
 
 ### `distillation.n_gpus_per_node` (int)
 
 Number of GPUs per node in the teacher resource pool. Default: `8`.
 
+Set this to `0` for `full_reverse_kl`; that mode does not create a remote
+teacher resource pool.
+
 ### `distillation.nnodes` (int)
 
 Number of nodes in the teacher resource pool. Default: `0` (effectively
-disables the pool — must be set to `≥ 1` when `enabled=True`).
+disables the pool; remote-teacher modes require `≥ 1` when enabled).
+
+For `full_reverse_kl`, keep this at `0` because the local teacher uses the
+actor worker's existing GPUs.
 
 **Constraint:** the total teacher pool size (`n_gpus_per_node × nnodes`) must
 exactly equal the sum of `(num_replicas × per_replica_world_size)` across all
@@ -268,15 +275,21 @@ Inference-engine config for this teacher; see [`RolloutConfig`](../../verl/worke
 `inference.response_length := 1`, since the teacher only scores the
 (prompt + response) prefix and emits one dummy token.
 
+These inference-server settings are not used by `full_reverse_kl`; the local
+teacher is run by the FSDP engine on the actor's training micro-batch.
+
 ---
 
 ### `distillation.distillation_loss.loss_mode` (str)
 
 Distillation divergence to use. Default: `"k3"`.
 
-Two registered families:
+Three registered families:
 
 - **Top-k** (`forward_kl_topk`): forward KL using the teacher's top-k logits.
+- **Exact local teacher** (`full_reverse_kl`): full-vocabulary reverse KL with
+  a frozen teacher colocated with the FSDP actor. The loss is directly
+  backpropagated through the student distribution.
 - **Single-sample KL estimators** (`kl`, `k1`, `abs`, `mse`, `k2`,
   `low_var_kl`, `k3`): per-token Monte Carlo estimators of reverse KL
   computed from the student's `log_probs` and the teacher's single
@@ -289,6 +302,13 @@ Two registered families:
 Only used when `loss_mode` requires top-$k$ (e.g. `forward_kl_topk`). Drives both
 the teacher's `prompt_logprobs` request size and (for vLLM) the engine's
 `max_logprobs` cap.
+
+### `distillation.distillation_loss.full_vocab_chunk_size` (int)
+
+Number of token positions processed per fp32 softmax chunk by
+`full_reverse_kl`. Default: `256`. Smaller values reduce the temporary
+softmax memory without changing the objective, but both models' raw logits
+for the current micro-batch are still materialized.
 
 ### `distillation.distillation_loss.use_task_rewards` (bool)
 
@@ -330,6 +350,9 @@ How the distillation signal is applied. `true` corresponds to PG OPD, `false` to
 - `use_policy_gradient=True` + `loss_mode="forward_kl_topk"` $\to$ warning. The
   PG update only moves $\nabla_\theta\log\pi_\theta(y_t|s_t)$ for the sampled token $y_t$, so the top-$k$
   distributional signal is largely unused.
+- `use_policy_gradient=True` + `loss_mode="full_reverse_kl"` $\to$ `ValueError`.
+  Exact reverse KL is already connected to the student logits and must be
+  directly backpropagated.
 
 ### `distillation.distillation_loss.policy_loss_mode` (str)
 
@@ -394,7 +417,30 @@ algorithm:
 
 ### GKD OPD
 
-For efficiency, the current implementation of GKD OPD uses a top-$k$ approximation to forward KL using the top-$k$ teacher logits and the forward KL:
+Exact Standard OPD reverse KL is available with a local FSDP teacher:
+
+```yaml
+distillation:
+   enabled: true
+   n_gpus_per_node: 0
+   nnodes: 0
+   teacher_models:
+      teacher_model:
+         model_path: Qwen/Qwen3-VL-8B-Instruct
+   distillation_loss:
+      loss_mode: full_reverse_kl
+      use_task_rewards: false
+      use_policy_gradient: false
+```
+
+This mode loads the teacher through the colocated reference-model engine,
+runs teacher forcing on each student-generated micro-batch, and computes
+$\mathrm{KL}(p_S\|p_T)$ over the complete vocabulary. It currently supports
+FSDP/FSDP2 only, requires identical student and teacher vocabularies, matching
+sequence-parallel sizes, and non-fused LM-head logits.
+
+For lower memory and a remote inference teacher, GKD OPD also provides a
+top-$k$ approximation to forward KL using the top-$k$ teacher logits:
 
 $$
 \mathcal{L}_{\mathrm{GKD}}^{(k)}(s_t)
@@ -408,7 +454,11 @@ $$
 \bigr].
 $$
 
-The reason GKD OPD is implemented only over the teacher top-$k$ logits is because current inference servers return log-probabilities for the sampled token and the teacher top-$k$ tokens, but do not support gathering log-probabilities at arbitrary token IDs. Therefore, the implementation supports teacher-top-$k$ forward KL, but not student-top-$k$ reverse KL.
+The remote-teacher path uses teacher top-$k$ because current inference servers
+return log-probabilities for the sampled token and teacher top-$k$ tokens, but
+do not support gathering log-probabilities at arbitrary token IDs. Therefore,
+that path supports teacher-top-$k$ forward KL, but not student-top-$k$ reverse
+KL. Use `full_reverse_kl` when exact reverse KL is required.
 
 To use GKD OPD, set `loss_mode=forward_kl_topk`, choose `topk`, and disable policy-gradient distillation:
 
@@ -614,13 +664,19 @@ A useful technique for debugging modifications and additions to the distillation
 
 ## Architecture
 
-OPD has two components:
+OPD has two execution paths:
 
-1. **Teacher logprob computation** — runs on a dedicated teacher resource pool as part of the agent loop.
-2. **Student optimization** — runs on the train workers, the same actor workers
-   that handle PPO/GRPO updates.
+1. **Remote teacher** — sampled-token estimators and `forward_kl_topk` run
+   teacher logprob computation on a dedicated resource pool in the agent loop.
+2. **Local exact teacher** — `full_reverse_kl` loads a frozen teacher through
+   the actor worker's reference engine and computes KL inside each train
+   micro-batch. It does not create a teacher resource pool or attach teacher
+   outputs to rollout data.
 
 ### Teacher logprob computation
+
+This section describes the remote-teacher path. It is skipped by
+`full_reverse_kl`.
 
 Teacher logprob computation is interleaved with rollouts inside the **Agent
 Loop**. Each sample's teacher call fires as soon as its rollout finishes (no batch-wide barrier) so teacher work overlaps with the still-running
@@ -704,17 +760,18 @@ Using the `DataProto` produced by the Agent Loop (rollouts + teacher logprobs in
    distillation is enabled, `self.loss_fn` is bound to `distillation_ppo_loss`
    at worker init; otherwise it is the standard `ppo_loss`.
 
-2. **Forward pass and (optional) inline top-k loss.** The training engine's
-   forward step runs the model forward and, for top-$k$ loss modes
-   (`distillation_use_topk=True`), invokes `distillation_ppo_loss` **as a
+2. **Forward pass and (optional) inline distributional loss.** The training engine's
+   forward step runs the model forward and, for logits-based loss modes
+   (`distillation_use_logits=True`), invokes `distillation_ppo_loss` **as a
    logits processor** while the full logits tensor is still in memory; this is
-   the `student_logits is not None` branch of `distillation_ppo_loss`. The
-   logits-processor branch dispatches to `compute_forward_kl_topk`, which has a
-   separate implementation per training engine (FSDP and Megatron). Per-token
-   `distillation_losses`, `student_mass`, `teacher_mass`, `overlap_count`, and
-   `overlap_token_advantage` tensors are written back into `model_output` so the
-   full logits can be freed before the final loss step. The overlap tensors are
-   used only for logging.
+   the `student_logits is not None` branch of `distillation_ppo_loss`.
+   `forward_kl_topk` dispatches to its engine-specific sparse loss;
+   `full_reverse_kl` runs the frozen local teacher on the same micro-batch and
+   computes exact reverse KL in fp32 vocabulary chunks. Per-token
+   `distillation_losses` are written into `model_output`; the sparse top-$k$
+   path additionally emits `student_mass`, `teacher_mass`, `overlap_count`, and
+   `overlap_token_advantage` diagnostics. The full logits can then be freed
+   before the final loss step.
 
 3. **Final loss.** After the forward, the engine calls the loss function with
    `model_output` (full logits already freed); this is the
@@ -774,5 +831,6 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
 ### **Tests**
 
 - `tests/workers/test_distillation_topk_symmetry_on_cpu.py` — top-k loss symmetry and overlap metric checks
+- `tests/workers/test_full_reverse_kl_on_cpu.py` — exact reverse-KL values, gradients, and validation checks
 - `tests/utils/test_special_megatron_kl_loss_tp.py` — Megatron KL loss and overlap metrics under tensor parallelism
 - `tests/special_e2e/run_fully_async_policy_opd.sh` — end-to-end OPD with the fully-async rollouter

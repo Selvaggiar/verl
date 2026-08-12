@@ -15,6 +15,7 @@
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
@@ -70,6 +71,53 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     p = log_p.exp()
     kld = p * (log_p - log_q)
     return kld.sum(dim=-1)
+
+
+def compute_full_reverse_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Compute exact token-wise ``KL(student || teacher)`` in fp32 chunks.
+
+    Chunking plus activation checkpointing prevents fp32 log-probability
+    intermediates from adding another pair of full ``[tokens, vocab]`` buffers
+    while preserving full-vocabulary KL.
+    """
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            "Student and teacher logits must have identical shapes for full reverse KL, "
+            f"but got {student_logits.shape=} and {teacher_logits.shape=}."
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"full_vocab_chunk_size must be positive, got {chunk_size}.")
+
+    original_shape = student_logits.shape[:-1]
+    vocab_size = student_logits.shape[-1]
+    flat_student = student_logits.reshape(-1, vocab_size)
+    flat_teacher = teacher_logits.reshape(-1, vocab_size)
+
+    def _reverse_kl_chunk(student_chunk: torch.Tensor, teacher_chunk: torch.Tensor) -> torch.Tensor:
+        student_log_probs = F.log_softmax(student_chunk.float(), dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_chunk.float(), dim=-1)
+        student_probs = student_log_probs.exp()
+        return (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+
+    token_losses = []
+    for start in range(0, flat_student.shape[0], chunk_size):
+        end = min(start + chunk_size, flat_student.shape[0])
+        student_chunk = flat_student[start:end]
+        teacher_chunk = flat_teacher[start:end]
+        if torch.is_grad_enabled() and student_chunk.requires_grad:
+            token_losses.append(checkpoint(_reverse_kl_chunk, student_chunk, teacher_chunk, use_reentrant=False))
+        else:
+            token_losses.append(_reverse_kl_chunk(student_chunk, teacher_chunk))
+
+    if not token_losses:
+        # A sequence-parallel rank may own only prompt positions. Preserve an
+        # empty edge to the student graph so all ranks can run backward.
+        return flat_student.sum(dim=-1, dtype=torch.float32).reshape(original_shape)
+    return torch.cat(token_losses, dim=0).reshape(original_shape)
 
 
 def compute_forward_kl_topk(

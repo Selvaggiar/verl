@@ -405,7 +405,7 @@ class FSDPEngine(BaseEngine):
             # We force reference policy to use CPUOffload to save memory.
             # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
             cpu_offload = None
-            if self.engine_config.forward_only:
+            if self.engine_config.forward_only and not self.engine_config.keep_forward_only_model_on_device:
                 cpu_offload = CPUOffload(offload_params=True)
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
@@ -432,7 +432,9 @@ class FSDPEngine(BaseEngine):
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
             offload_policy = None
-            if self.engine_config.offload_policy or self.engine_config.forward_only:
+            if self.engine_config.offload_policy or (
+                self.engine_config.forward_only and not self.engine_config.keep_forward_only_model_on_device
+            ):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
@@ -749,7 +751,7 @@ class FSDPEngine(BaseEngine):
         """
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
-        if self.engine_config.forward_only:
+        if self.engine_config.forward_only and not self.engine_config.keep_forward_only_model_on_device:
             # force cpu_offload
             return
 
@@ -954,6 +956,115 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    def _response_logit_mask(self, data: TensorDict) -> torch.Tensor:
+        """Build a packed mask for logits that predict valid response tokens."""
+        prompt_ids = data["prompts"]
+        response_ids = data["responses"]
+        response_mask = data["response_mask"]
+        if prompt_ids.is_nested:
+            prompt_lens = prompt_ids.offsets().diff()
+            response_lens = response_ids.offsets().diff()
+            response_masks = response_mask.unbind()
+        else:
+            attention_mask = data["attention_mask"]
+            prompt_width = prompt_ids.shape[1]
+            prompt_lens = attention_mask[:, :prompt_width].sum(dim=1)
+            response_lens = attention_mask[:, prompt_width:].sum(dim=1)
+            response_masks = response_mask
+
+        sequence_lens = data["input_ids"].offsets().diff()
+        packed_mask = torch.zeros(int(sequence_lens.sum().item()), dtype=torch.bool, device=sequence_lens.device)
+        sequence_start = 0
+        for prompt_len, response_len, sequence_len, current_response_mask in zip(
+            prompt_lens, response_lens, sequence_lens, response_masks, strict=True
+        ):
+            prompt_len = int(prompt_len.item())
+            response_len = int(response_len.item())
+            sequence_len = int(sequence_len.item())
+            if prompt_len <= 0:
+                raise ValueError("full_reverse_kl requires every sequence to contain at least one prompt token.")
+            response_start = sequence_start + prompt_len - 1
+            packed_mask[response_start : response_start + response_len] = current_response_mask[:response_len].bool()
+            sequence_start += sequence_len
+
+        packed_mask = packed_mask.unsqueeze(0)
+        if self.use_ulysses_sp:
+            packed_mask, _, _ = ulysses_pad_and_slice_inputs(
+                packed_mask,
+                position_ids_rmpad=None,
+                sp_size=self.ulysses_sequence_parallel_size,
+                pad_value=False,
+            )
+        return packed_mask
+
+    def compute_full_reverse_kl(
+        self,
+        student_logits: torch.Tensor,
+        data: TensorDict,
+        distillation_config,
+        data_format: str = "thd",
+    ) -> dict[str, torch.Tensor]:
+        """Run the frozen local teacher and compute exact full-vocabulary reverse KL."""
+        del data_format
+        if torch.is_grad_enabled() and not student_logits.requires_grad:
+            raise RuntimeError("full_reverse_kl received student logits detached from the actor autograd graph.")
+        use_remove_padding = tu.get_non_tensor_data(data=data, key="use_remove_padding", default=True)
+        use_fused_kernels = tu.get_non_tensor_data(data=data, key="use_fused_kernels", default=False)
+        if use_fused_kernels:
+            raise NotImplementedError("full_reverse_kl requires actor_rollout_ref.model.use_fused_kernels=False.")
+
+        data = data.to(get_device_id())
+        model_inputs, output_args = self.prepare_model_inputs(micro_batch=data)
+        device_name = get_device_name()
+        autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+        autocast_ctx: ContextManager = (
+            nullcontext()
+            if autocast_dtype == torch.float32
+            else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+        )
+        with torch.no_grad(), autocast_ctx:
+            raw_output = self.module(**model_inputs, use_cache=False)
+            if use_remove_padding:
+                teacher_logits = raw_output.logits.squeeze(0)
+                if isinstance(teacher_logits, DTensor):
+                    teacher_logits = teacher_logits.full_tensor()
+                temperature = output_args["temperature_rmpad"]
+                teacher_logits = teacher_logits / temperature.clamp(min=1e-8).unsqueeze(-1).to(teacher_logits.dtype)
+            else:
+                teacher_logits = raw_output.logits
+                if isinstance(teacher_logits, DTensor):
+                    teacher_logits = teacher_logits.full_tensor()
+                temperature = output_args["temperature"].unsqueeze(-1).unsqueeze(-1)
+                teacher_logits = teacher_logits / temperature.clamp(min=1e-8).to(teacher_logits.dtype)
+                cu_seqlens = data["input_ids"].offsets()
+                seq_lengths = cu_seqlens.diff()
+                starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
+                teacher_logits = torch.nested.narrow(
+                    teacher_logits, 1, starts, seq_lengths, layout=torch.jagged
+                ).values()
+
+        from verl.trainer.distillation.fsdp.losses import compute_full_reverse_kl
+
+        response_logit_mask = self._response_logit_mask(data)
+        if response_logit_mask.shape != student_logits.shape[:-1]:
+            raise ValueError(
+                "Response logit mask must align with local student logits, but got "
+                f"{response_logit_mask.shape=} and {student_logits.shape=}."
+            )
+        teacher_logits = teacher_logits.unsqueeze(0)
+        response_losses = compute_full_reverse_kl(
+            student_logits=student_logits[response_logit_mask],
+            teacher_logits=teacher_logits[response_logit_mask],
+            chunk_size=distillation_config.distillation_loss.full_vocab_chunk_size,
+        )
+        if torch.is_grad_enabled() and response_losses.numel() > 0 and not response_losses.requires_grad:
+            raise RuntimeError("full_reverse_kl token losses are detached from the actor autograd graph.")
+        distillation_losses = student_logits.new_zeros(student_logits.shape[:-1], dtype=torch.float32)
+        distillation_losses[response_logit_mask] = response_losses
+        if torch.is_grad_enabled() and response_losses.numel() > 0 and not distillation_losses.requires_grad:
+            raise RuntimeError("full_reverse_kl scatter detached token losses from the actor autograd graph.")
+        return {"distillation_losses": distillation_losses}
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1107,6 +1218,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        distillation_use_logits = tu.get_non_tensor_data(
+            data=micro_batch, key="distillation_use_logits", default=distillation_use_topk
+        )
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
@@ -1134,7 +1248,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # (veomni's chunk_topk_distill path), extract the per-token
                 # distillation outputs and store them as nested tensors —
                 # same model_output keys as the eager logit-processor path.
-                if distillation_use_topk:
+                if distillation_use_logits:
                     aux_outputs = getattr(output, "fused_linear_aux", None)
                     if aux_outputs is not None and aux_outputs.distillation_losses is not None:
                         cu_seqlens = input_ids.offsets()
@@ -1171,7 +1285,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         )
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
-                if distillation_use_topk:
+                if distillation_use_logits:
                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
@@ -1286,7 +1400,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # (log_probs is also not gathered) and pad_size is only
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
-                    if distillation_use_topk:
+                    if distillation_use_logits:
                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                         for k, v in outputs.items():
                             v = v.squeeze(0)

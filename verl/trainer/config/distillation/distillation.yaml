@@ -39,6 +39,9 @@ distillation_loss:
   # Optional min clamp value for log probabilities for stability, e.g., log q - log p where p or q are very close to zero.
   log_prob_min_clamp: null
 
+  # Token positions per fp32 softmax chunk for loss_mode=full_reverse_kl.
+  full_vocab_chunk_size: 256
+
   # Whether to incorporate distillation loss as a reward.
   use_policy_gradient: false
 

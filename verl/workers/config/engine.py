@@ -243,6 +243,8 @@ class FSDPEngineConfig(EngineConfig):
         forward_prefetch (bool): Whether to prefetch parameters for next forward pass, default False
         model_dtype (str): Model data type used to initialize the transformers model. default "fp32"
         use_orig_params (bool): Whether to use original parameters when initialize FSDP1, default False
+        keep_forward_only_model_on_device (bool): Disable layer-wise CPU offload for a forward-only model. The
+            regular param_offload setting can still move the model between phases, default False.
         seed (int): Random seed for reproducibility.
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
             in distributed training. Important: this will negatively impact performance, so only use it for
@@ -252,8 +254,12 @@ class FSDPEngineConfig(EngineConfig):
         qat (QATEngineConfig): QAT configuration, default disabled
     """
 
-    # ulysses_sequence_parallel_size is mutable for backward compatibility
-    _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
+    # These fields are finalized by the colocated worker after role-specific
+    # actor/reference configuration has been resolved.
+    _mutable_fields = EngineConfig._mutable_fields | {
+        "keep_forward_only_model_on_device",
+        "ulysses_sequence_parallel_size",
+    }
 
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)
@@ -263,6 +269,7 @@ class FSDPEngineConfig(EngineConfig):
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False
+    keep_forward_only_model_on_device: bool = False
     mixed_precision: Optional[dict[str, Any]] = None
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False

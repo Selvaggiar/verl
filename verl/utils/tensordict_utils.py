@@ -910,9 +910,24 @@ def contiguous(data: TensorDict) -> TensorDict:
 def maybe_fix_3d_position_ids(data: TensorDict):
     # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    # This is likely a bug in tensordict. TransferQueue can also infer the fixed M-RoPE coordinate axis as
+    # ragged when all sequence lengths are equal, in which case the values must be rebuilt rather than relabeled.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        position_ids = data["position_ids"]
+        if position_ids._ragged_idx == 2:
+            return
+
+        offset_total = int(position_ids.offsets()[-1].item())
+        values = position_ids.values()
+        if values.shape[1] == offset_total:
+            position_ids._ragged_idx = 2
+        elif values.shape[0] == offset_total:
+            data["position_ids"] = nested_tensor_from_tensor_list(list(position_ids.unbind()), ragged_idx=2)
+        else:
+            raise ValueError(
+                "Cannot recover the ragged token dimension for VLM position_ids: "
+                f"{values.shape=}, {offset_total=}, ragged_idx={position_ids._ragged_idx}."
+            )
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

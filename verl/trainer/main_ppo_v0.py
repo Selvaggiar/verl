@@ -21,9 +21,16 @@ import socket
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+from verl.trainer.ppo.utils import (
+    create_rl_dataset,
+    create_rl_sampler,
+    need_critic,
+    need_local_teacher_policy,
+    need_reference_policy,
+    need_teacher_policy,
+    validate_local_teacher_policy,
+)
 from verl.utils.config import validate_config
 
 
@@ -46,7 +53,7 @@ class BaseTaskRunner:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         # Ref policy is fused into ActorRolloutRefWorker unless LoRA is used with a dedicated ref model.
-        if need_reference_policy(config) and not ref_in_actor:
+        if (need_reference_policy(config) and not ref_in_actor) or need_local_teacher_policy(config):
             role = Role.ActorRolloutRef
         else:
             role = Role.ActorRollout
@@ -85,7 +92,7 @@ class BaseTaskRunner:
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if need_teacher_policy(config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -115,7 +122,7 @@ class BaseTaskRunner:
         """Add teacher model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if is_distillation_enabled(config.get("distillation")):
+        if need_teacher_policy(config):
             # we do not use teacher model workers, so we only register teacher model in resource pool
             # without registering a teacher model worker in role-worker mapping
             self.mapping[Role.TeacherModel] = "teacher_pool"
@@ -166,6 +173,7 @@ class TaskRunner(BaseTaskRunner):
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        validate_local_teacher_policy(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)

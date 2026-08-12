@@ -43,6 +43,17 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
+def uses_local_teacher(config: Optional[DistillationConfig]) -> bool:
+    """Return whether distillation is computed with a teacher colocated with the actor."""
+    if not is_distillation_enabled(config):
+        return False
+    loss_config = config.distillation_loss
+    settings = getattr(loss_config, "loss_settings", None)
+    if settings is None:
+        settings = get_distillation_loss_settings(loss_config.loss_mode)
+    return settings.use_local_teacher
+
+
 @dataclass
 class DistillationLossSettings(BaseConfig):
     """
@@ -52,19 +63,22 @@ class DistillationLossSettings(BaseConfig):
         names (str | list[str]): Name(s) to register the distillation loss function under.
         use_topk (bool): Whether the loss function uses top-k log probabilities.
         use_estimator (bool): Whether the loss function uses single-sample KL estimators.
+        use_local_teacher (bool): Whether the loss requires a local teacher forward pass.
     """
 
     names: str | list[str] = field(default_factory=list)
     use_topk: bool = False
     use_estimator: bool = False
+    use_local_teacher: bool = False
 
     _mutable_fields = {"names"}
 
     def __post_init__(self):
         self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
+        if sum([self.use_topk, self.use_estimator, self.use_local_teacher]) != 1:
             raise ValueError(
-                f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
+                "Expected exactly one distillation input mode, but got "
+                f"{self.use_estimator=}, {self.use_topk=}, {self.use_local_teacher=}."
             )
 
 
@@ -162,6 +176,28 @@ def compute_topk_loss(
     return outputs
 
 
+def compute_logits_distillation_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    data: TensorDict,
+    student_logits: torch.Tensor,
+    data_format: str,
+    local_teacher_fn: Optional[Callable] = None,
+) -> dict[str, torch.Tensor]:
+    """Compute a distributional loss while student logits remain in the autograd graph."""
+    loss_settings = distillation_config.distillation_loss.loss_settings
+    if loss_settings.use_local_teacher:
+        if local_teacher_fn is None:
+            raise RuntimeError("full_reverse_kl requires a local teacher attached to the actor worker.")
+        return local_teacher_fn(
+            student_logits=student_logits,
+            data=data,
+            distillation_config=distillation_config,
+            data_format=data_format,
+        )
+    return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -170,6 +206,7 @@ def distillation_ppo_loss(
     dp_group=None,
     student_logits: torch.Tensor = None,
     data_format: str = "thd",
+    local_teacher_fn: Optional[Callable] = None,
 ):
     """Loss function used both for logit processor and final policy loss.
     - student_logits is not None, compute the topk loss in logit processor.
@@ -202,7 +239,14 @@ def distillation_ppo_loss(
 
     # Called as logits processor
     if student_logits is not None:
-        return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
+        return compute_logits_distillation_loss(
+            config,
+            distillation_config,
+            data,
+            student_logits,
+            data_format,
+            local_teacher_fn=local_teacher_fn,
+        )
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
@@ -359,6 +403,23 @@ def compute_forward_kl_topk(
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names="full_reverse_kl", use_local_teacher=True))
+def compute_full_reverse_kl(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Collect exact token-wise reverse KL produced by the local teacher logits processor."""
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    if data["response_mask"].is_nested:
+        response_mask = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask = data["response_mask"].bool()
+    assert distillation_losses.shape == response_mask.shape
+    return distillation_losses, {}
 
 
 @register_distillation_loss(

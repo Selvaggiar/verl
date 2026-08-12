@@ -45,11 +45,14 @@ class DistillationLossConfig(BaseConfig):
     log_prob_min_clamp (float, optional):
         Minimum value to clamp log probabilities for stability, e.g., log q - log p where p or q are
         very close to zero. If None, no clamping is applied.
+    full_vocab_chunk_size (int):
+        Number of token positions per fp32 softmax chunk for full_reverse_kl.
     use_policy_gradient (bool):
         Whether to incorporate distillation loss as a reward, as done
         by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
         Otherwise, distillation loss is directly backpropagated as a supervised loss,
-        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
+        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3,
+        forward_kl_topk, or full_reverse_kl.
     policy_loss_mode (str):
         Name of the policy loss to use when use_policy_gradient is true.
     clip_ratio (float):
@@ -68,6 +71,10 @@ class DistillationLossConfig(BaseConfig):
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
+
+    # Number of token positions per fp32 softmax chunk for exact full-vocabulary
+    # reverse KL. This affects peak memory and throughput, not the objective.
+    full_vocab_chunk_size: int = 256
 
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
     # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
@@ -122,6 +129,15 @@ class DistillationLossConfig(BaseConfig):
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
             )
+
+        if self.loss_settings.use_local_teacher and self.use_policy_gradient:
+            raise ValueError(
+                f"{self.loss_mode} directly backpropagates through the student distribution and requires "
+                "use_policy_gradient=False."
+            )
+
+        if self.full_vocab_chunk_size <= 0:
+            raise ValueError(f"full_vocab_chunk_size must be positive, got {self.full_vocab_chunk_size}.")
 
 
 @dataclass
@@ -270,6 +286,10 @@ class DistillationConfig(BaseConfig):
         if not self.enabled:
             return
 
+        if self.distillation_loss.loss_settings.use_local_teacher:
+            self.teacher_models = self._resolve_local_teacher_model()
+            return
+
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
@@ -285,6 +305,17 @@ class DistillationConfig(BaseConfig):
                 f"the distillation resource pool size "
                 f"({self.n_gpus_per_node=} * {self.nnodes=} = {total_pool_size})."
             )
+
+    def _resolve_local_teacher_model(self) -> dict[str, DistillationTeacherModelConfig]:
+        if set(self.teacher_models) != {"teacher_model"}:
+            raise ValueError("Local full-vocabulary distillation currently supports exactly one teacher model.")
+        teacher_config = omega_conf_to_dataclass(
+            self.teacher_models["teacher_model"], dataclass_type=DistillationTeacherModelConfig
+        )
+        teacher_config.key = "default"
+        teacher_config.num_replicas = 1
+        teacher_config.check_configured()
+        return {teacher_config.key: teacher_config}
 
     def _resolve_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
         assert "teacher_model" in self.teacher_models

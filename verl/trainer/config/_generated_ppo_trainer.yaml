@@ -36,6 +36,7 @@ actor_rollout_ref:
       forward_prefetch: false
       model_dtype: fp32
       use_orig_params: false
+      keep_forward_only_model_on_device: false
       seed: 42
       full_determinism: false
       ulysses_sequence_parallel_size: 1
@@ -211,6 +212,7 @@ actor_rollout_ref:
       forward_prefetch: false
       model_dtype: fp32
       use_orig_params: false
+      keep_forward_only_model_on_device: false
       seed: 42
       full_determinism: false
       ulysses_sequence_parallel_size: 1
@@ -246,6 +248,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1
     top_p: 1
+    repetition_penalty: 1.0
     full_determinism: false
     seed: 42
     prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -510,6 +513,7 @@ critic:
     forward_prefetch: false
     model_dtype: fp32
     use_orig_params: false
+    keep_forward_only_model_on_device: false
     seed: 42
     full_determinism: false
     ulysses_sequence_parallel_size: 1
@@ -801,6 +805,7 @@ distillation:
     distillation_loss_coef: 1.0
     loss_max_clamp: null
     log_prob_min_clamp: null
+    full_vocab_chunk_size: 256
     use_policy_gradient: false
     policy_loss_mode: vanilla
     clip_ratio: 0.2

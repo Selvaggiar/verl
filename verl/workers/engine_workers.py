@@ -30,7 +30,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled, uses_local_teacher
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
@@ -379,6 +379,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
+        maybe_fix_3d_position_ids(data)
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
@@ -449,6 +450,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
+        self.local_distillation_teacher = uses_local_teacher(distillation_config)
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
@@ -517,8 +519,49 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
 
-            # The ref model does not need to enable MTP; force it to false.
-            ref_config.model_config = deepcopy(model_config)
+            # full_reverse_kl reuses the colocated reference engine as a frozen teacher.
+            if self.local_distillation_teacher:
+                if ref_config.strategy not in ("fsdp", "fsdp2"):
+                    raise NotImplementedError("full_reverse_kl currently supports only FSDP and FSDP2.")
+                teacher_models = self.distillation_config.teacher_models
+                teacher_config = teacher_models.get("teacher_model")
+                if teacher_config is None:
+                    teacher_config = next(iter(teacher_models.values()))
+                teacher_model_config = deepcopy(self.config.model)
+                with open_dict(teacher_model_config):
+                    teacher_model_config.path = teacher_config.model_path
+                    teacher_model_config.hf_config_path = None
+                    teacher_model_config.tokenizer_path = None
+                    teacher_model_config.enable_gradient_checkpointing = False
+                    teacher_model_config.lora_rank = 0
+                    teacher_model_config.lora_adapter_path = None
+                    if "lora" in teacher_model_config:
+                        teacher_model_config.lora.rank = 0
+                        teacher_model_config.lora.adapter_path = None
+                ref_config.model_config = omega_conf_to_dataclass(teacher_model_config)
+                student_text_config = getattr(model_config.hf_config, "text_config", model_config.hf_config)
+                teacher_text_config = getattr(
+                    ref_config.model_config.hf_config, "text_config", ref_config.model_config.hf_config
+                )
+                student_vocab_size = getattr(student_text_config, "vocab_size", None)
+                teacher_vocab_size = getattr(teacher_text_config, "vocab_size", None)
+                if student_vocab_size != teacher_vocab_size:
+                    raise ValueError(
+                        "full_reverse_kl requires identical student and teacher vocabularies, but got "
+                        f"{student_vocab_size=} and {teacher_vocab_size=}."
+                    )
+                student_tokenizer = model_config.tokenizer
+                teacher_tokenizer = ref_config.model_config.tokenizer
+                if (
+                    student_tokenizer is not None
+                    and teacher_tokenizer is not None
+                    and student_tokenizer.get_vocab() != teacher_tokenizer.get_vocab()
+                ):
+                    raise ValueError("full_reverse_kl requires identical student and teacher token-to-id mappings.")
+            else:
+                ref_config.model_config = deepcopy(model_config)
+
+            # The ref/local teacher model does not need to enable MTP.
             ref_config.model_config.mtp = MtpConfig(enable=False)
 
             # construct TrainingWorkerConfig
@@ -536,7 +579,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
                 self.config.ref.ppo_micro_batch_size_per_gpu
             )
-            ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            ref_training_config.engine_config.use_remove_padding = ref_config.model_config.get(
+                "use_remove_padding", False
+            )
+            if self.local_distillation_teacher:
+                ref_training_config.engine_config.keep_forward_only_model_on_device = True
 
             self.ref = self.ref_worker_cls(config=ref_training_config)
             self.ref.reset()
@@ -581,8 +628,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
             if self.distillation_enabled:
+                if self.local_distillation_teacher:
+                    if self.ref is None:
+                        raise RuntimeError("full_reverse_kl requires an ActorRolloutRef worker with a local teacher.")
+                    if actor_config.strategy not in ("fsdp", "fsdp2"):
+                        raise NotImplementedError("full_reverse_kl currently supports only FSDP and FSDP2.")
+                    if actor_config.model_config.use_fused_kernels:
+                        raise ValueError("full_reverse_kl requires actor_rollout_ref.model.use_fused_kernels=False.")
+                    actor_sp = actor_training_config.engine_config.ulysses_sequence_parallel_size
+                    teacher_sp = self.ref.engine_config.ulysses_sequence_parallel_size
+                    if actor_sp != teacher_sp:
+                        raise ValueError(
+                            "full_reverse_kl requires matching actor and teacher sequence parallel sizes, "
+                            f"but got {actor_sp=} and {teacher_sp=}."
+                        )
+                local_teacher_fn = self.ref.engine.compute_full_reverse_kl if self.local_distillation_teacher else None
                 self.loss_fn = partial(
-                    distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                    distillation_ppo_loss,
+                    config=actor_config,
+                    distillation_config=distillation_config,
+                    local_teacher_fn=local_teacher_fn,
                 )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
@@ -654,7 +719,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        if self.local_distillation_teacher:
+            with self.ref.engine.eval_mode():
+                output = self.actor.train_mini_batch(data=data)
+        else:
+            output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
